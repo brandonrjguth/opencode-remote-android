@@ -1,0 +1,11 @@
+{
+  "name": "opencode-remote-android",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "setup:linux": "node scripts/setup-linux.mjs",
+    "server:start": "node server/index.mjs",
+    "server:set-root": "node server/cli.mjs set-root",
+    "server:show-config": "node server/cli.mjs show-config"
+  }
+}

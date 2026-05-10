@@ -25,14 +25,40 @@ It is designed to make daily usage simple: connect to your server, check active 
 - networking: OpenCode HTTP API (`/global/health`, `/session/*`, `/command`)
 - CI/CD: GitHub Actions for cloud APK builds
 
-## OpenCode Server Setup
+## Server Setup
 
-Start the OpenCode server with network access and Basic Auth.
+The app now expects a small wrapper server from this repo in front of the OpenCode server.
+
+### Quick Linux setup
+
+If this machine uses `systemd`, you can run the one-shot installer from the repo root:
+
+```bash
+npm run setup:linux
+```
+
+It will:
+
+- prompt for the shared username and password
+- configure OpenCode on `127.0.0.1:4096`
+- configure the wrapper on `0.0.0.0:4097`
+- save the managed root directory in `server-config.json`
+- install and start `systemd --user` services for both servers
+
+The app still lets the user enter host, port, username, and password manually. The built-in default port remains `4097`.
+
+Architecture:
+
+- `opencode-ai serve` runs privately on `127.0.0.1:4096`
+- this repo's wrapper server runs on your LAN-facing port, by default `4097`
+- the wrapper owns the managed root directory, creates subfolders for new sessions, and forwards requests to OpenCode
+
+### 1. Start OpenCode upstream locally
 
 macOS / Linux (bash/zsh):
 
 ```bash
-OPENCODE_SERVER_USERNAME=opencode OPENCODE_SERVER_PASSWORD=your-password npx -y opencode-ai serve --hostname 0.0.0.0 --port 4096
+OPENCODE_SERVER_USERNAME=opencode OPENCODE_SERVER_PASSWORD=your-password npx -y opencode-ai serve --hostname 127.0.0.1 --port 4096
 ```
 
 Windows PowerShell:
@@ -40,32 +66,42 @@ Windows PowerShell:
 ```powershell
 $env:OPENCODE_SERVER_USERNAME="opencode"
 $env:OPENCODE_SERVER_PASSWORD="your-password"
-npx -y opencode-ai serve --hostname 0.0.0.0 --port 4096
+npx -y opencode-ai serve --hostname 127.0.0.1 --port 4096
 ```
 
-Windows cmd:
+### 2. Configure the managed root directory
 
-```cmd
-set OPENCODE_SERVER_USERNAME=opencode
-set OPENCODE_SERVER_PASSWORD=your-password
-npx -y opencode-ai serve --hostname 0.0.0.0 --port 4096
-```
-
-For browser-based web debugging, add CORS origins as needed:
+From this repo root:
 
 ```bash
-npx -y opencode-ai serve --hostname 0.0.0.0 --port 4096 --cors http://localhost:5173 --cors http://127.0.0.1:5173
+npm run server:set-root -- /absolute/path/to/projects
 ```
 
-For Android APK (Capacitor native HTTP) CORS is usually not required, but keeping explicit origins is still fine.
+This is the sandbox-style root the wrapper uses for new session folders.
 
-If you use browser mode from another host/IP, include both localhost and your dev host:
+### 3. Start the wrapper server
 
-```powershell
-npx -y opencode-ai serve --hostname 0.0.0.0 --port 4096 --cors http://localhost --cors http://localhost:5173 --cors http://<YOUR_PC_IP>:5173
+macOS / Linux (bash/zsh):
+
+```bash
+OPENCODE_UPSTREAM_URL=http://127.0.0.1:4096 OPENCODE_UPSTREAM_USERNAME=opencode OPENCODE_UPSTREAM_PASSWORD=your-password node server/index.mjs --hostname 0.0.0.0 --port 4097
 ```
 
-If remote/mobile cannot connect, open TCP 4096 in your OS firewall and network firewall/NAT.
+If you want the wrapper itself protected with Basic Auth, also set:
+
+```bash
+OPENCODE_REMOTE_USERNAME=opencode OPENCODE_REMOTE_PASSWORD=your-password
+```
+
+### 4. Point the Android app at the wrapper
+
+Use these app settings:
+
+- Host: your computer IP
+- Port: `4097`
+- Username/password: wrapper credentials if configured, otherwise any values are ignored
+
+If remote/mobile cannot connect, open TCP `4097` in your OS firewall and network firewall/NAT.
 
 ## Run Locally (Web) to test
 

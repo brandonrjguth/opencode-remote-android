@@ -4,6 +4,7 @@ import type {
   DiffFile,
   HealthResponse,
   MessageEnvelope,
+  PermissionRequest,
   ServerConfig,
   Session,
   SessionStatus,
@@ -29,6 +30,70 @@ type RequestOptions = {
   body?: unknown
 }
 
+function normalizeStatusType(value: unknown): string {
+  if (typeof value !== "string") return "idle"
+  const type = value.trim().toLowerCase()
+  if (!type) return "idle"
+  if (["running", "working", "in_progress", "in-progress", "active", "pending", "queued"].includes(type)) return "busy"
+  if (["retrying", "error", "failed"].includes(type)) return "retry"
+  if (["done", "complete", "completed", "success", "succeeded", "ready", "aborted", "cancelled", "canceled"].includes(type)) return "idle"
+  return type
+}
+
+function toSessionStatus(value: unknown): SessionStatus | null {
+  if (typeof value === "string") {
+    return { type: normalizeStatusType(value) }
+  }
+  if (!value || typeof value !== "object") return null
+  const raw = value as Record<string, unknown>
+  const rawType = raw.type ?? raw.status ?? raw.state
+  if (!rawType) return null
+  const attempt = typeof raw.attempt === "number" ? raw.attempt : undefined
+  const message = typeof raw.message === "string" ? raw.message : undefined
+  const next = typeof raw.next === "number" ? raw.next : undefined
+  return {
+    type: normalizeStatusType(rawType),
+    attempt,
+    message,
+    next
+  }
+}
+
+function parseStatusMap(value: unknown): Record<string, SessionStatus> {
+  const map: Record<string, SessionStatus> = {}
+  if (!value || typeof value !== "object") return map
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (!item || typeof item !== "object") continue
+      const row = item as Record<string, unknown>
+      const sessionID = row.sessionID ?? row.sessionId ?? row.id
+      if (typeof sessionID !== "string" || !sessionID) continue
+      const status = toSessionStatus(row.status ?? row)
+      if (!status) continue
+      map[sessionID] = status
+    }
+    return map
+  }
+
+  const payload = value as Record<string, unknown>
+  const nested = payload.statuses ?? payload.data
+  if (nested && nested !== value) {
+    const nestedMap = parseStatusMap(nested)
+    if (Object.keys(nestedMap).length > 0) {
+      return nestedMap
+    }
+  }
+
+  for (const [sessionID, rawStatus] of Object.entries(payload)) {
+    const status = toSessionStatus(rawStatus)
+    if (!status) continue
+    map[sessionID] = status
+  }
+
+  return map
+}
+
 async function request<T>(config: ServerConfig, path: string, options: RequestOptions = {}): Promise<T> {
   const target = `${baseUrl(config)}${path}`
 
@@ -45,8 +110,9 @@ async function request<T>(config: ServerConfig, path: string, options: RequestOp
   const method = options.method ?? "GET"
 
   if (Capacitor.isNativePlatform()) {
+    let response: { status: number; data: unknown }
     try {
-      const response = await CapacitorHttp.request({
+      response = await CapacitorHttp.request({
         url: target,
         method,
         headers,
@@ -54,21 +120,33 @@ async function request<T>(config: ServerConfig, path: string, options: RequestOp
         connectTimeout: 12_000,
         readTimeout: 30_000
       })
-
-      if (response.status >= 400) {
-        const body = response.data
+    } catch (raw) {
+      const err = raw as { status?: number; data?: unknown; message?: string }
+      if (err.status) {
+        const body = err.data
         const detail =
           (typeof body === "object" && body && (body as { data?: { message?: string } }).data?.message) ||
           (typeof body === "object" && body && (body as { message?: string }).message) ||
-          JSON.stringify(body)
-        throw new Error(detail || `HTTP ${response.status}`)
+          (typeof body === "string" && body) ||
+          err.message ||
+          ""
+        throw new Error(detail || `HTTP ${err.status}`)
       }
-
-      if (response.status === 204) return true as T
-      return response.data as T
-    } catch {
       throw new Error(`Network error: cannot reach ${target}. Check host, port, and firewall.`)
     }
+
+    if (response.status >= 400) {
+      const body = response.data
+      const detail =
+        (typeof body === "object" && body && (body as { data?: { message?: string } }).data?.message) ||
+        (typeof body === "object" && body && (body as { message?: string }).message) ||
+        (typeof body === "string" && body) ||
+        ""
+      throw new Error(detail || `HTTP ${response.status}`)
+    }
+
+    if (response.status === 204) return true as T
+    return response.data as T
   }
 
   let response: Response
@@ -108,20 +186,73 @@ export const api = {
     return request<HealthResponse>(config, "/global/health")
   },
 
+  getConfig(config: ServerConfig) {
+    return request<{ model?: string }>(config, "/config")
+  },
+
+  getRemoteConfig(config: ServerConfig) {
+    return request<{ rootDir: string }>(config, "/remote/config")
+  },
+
+  listManagedFolders(config: ServerConfig) {
+    return request<{ rootDir: string; folders: string[] }>(config, "/remote/folder")
+  },
+
   listSessions(config: ServerConfig) {
     return request<Session[]>(config, "/session")
   },
 
-  listStatuses(config: ServerConfig) {
-    return request<Record<string, SessionStatus>>(config, "/session/status")
+  async listStatuses(config: ServerConfig) {
+    const payload = await request<unknown>(config, "/session/status")
+    return parseStatusMap(payload)
   },
 
   listCommands(config: ServerConfig) {
-    return request<CommandInfo[]>(config, "/command")
+    return request<CommandInfo[]>(config, "/command?limit=50")
   },
 
-  createSession(config: ServerConfig, title?: string) {
-    return request<Session>(config, "/session", { method: "POST", body: { title } })
+  createSession(
+    config: ServerConfig,
+    title?: string,
+    directory?: string,
+    agent?: string,
+    model?: { providerID: string; modelID: string; variant?: string }
+  ) {
+    return request<Session>(config, withDirectory("/session", directory), {
+      method: "POST",
+      body: {
+        title,
+        ...(agent ? { agent } : {}),
+        ...(model ? {
+          model: {
+            id: model.modelID,
+            providerID: model.providerID,
+            ...(model.variant ? { variant: model.variant } : {})
+          }
+        } : {})
+      }
+    })
+  },
+
+  createManagedSession(
+    config: ServerConfig,
+    body: { title?: string; folder?: string; agent?: string; model?: { providerID: string; modelID: string; variant?: string } }
+  ) {
+    return request<Session>(config, "/remote/session", { method: "POST", body })
+  },
+
+  createSessionWithModel(config: ServerConfig, title: string, model: { providerID: string; modelID: string; variant?: string }, directory?: string) {
+    return request<Session>(config, withDirectory("/session", directory), {
+      method: "POST",
+      body: {
+        title,
+        model: {
+          id: model.modelID,
+          providerID: model.providerID,
+          ...(model.variant ? { variant: model.variant } : {})
+        }
+      }
+    })
   },
 
   renameSession(config: ServerConfig, id: string, title: string) {
@@ -144,17 +275,37 @@ export const api = {
     return request<DiffFile[]>(config, `/session/${sessionID}/diff`)
   },
 
-  sendPrompt(config: ServerConfig, sessionID: string, text: string, directory?: string) {
+  sendPrompt(
+    config: ServerConfig,
+    sessionID: string,
+    text: string,
+    directory?: string,
+    model?: { providerID: string; modelID: string; variant?: string },
+    variant?: string,
+    agent?: string
+  ) {
+    const body: Record<string, unknown> = { parts: [{ type: "text", text }] }
+    if (model) body.model = { providerID: model.providerID, modelID: model.modelID }
+    if (variant) body.variant = variant
+    if (agent) body.agent = agent
     return request<MessageEnvelope>(config, withDirectory(`/session/${sessionID}/message`, directory), {
       method: "POST",
-      body: { parts: [{ type: "text", text }] }
+      body
     })
   },
 
-  sendCommand(config: ServerConfig, sessionID: string, command: string, argumentsText: string, directory?: string) {
+  sendCommand(
+    config: ServerConfig,
+    sessionID: string,
+    command: string,
+    argumentsText: string,
+    directory?: string,
+    variant?: string,
+    agent?: string
+  ) {
     return request<MessageEnvelope>(config, withDirectory(`/session/${sessionID}/command`, directory), {
       method: "POST",
-      body: { command, arguments: argumentsText }
+      body: { command, arguments: argumentsText, ...(variant ? { variant } : {}), ...(agent ? { agent } : {}) }
     })
   },
 
@@ -163,5 +314,33 @@ export const api = {
       method: "POST",
       body: {}
     })
+  },
+
+  listPermissions(config: ServerConfig, directory?: string) {
+    return request<PermissionRequest[]>(config, withDirectory("/permission", directory))
+  },
+
+  replyPermission(config: ServerConfig, requestID: string, reply: string, message?: string, directory?: string) {
+    return request<boolean>(config, withDirectory(`/permission/${requestID}/reply`, directory), {
+      method: "POST",
+      body: { reply, message }
+    })
+  },
+
+  listProviders(config: ServerConfig) {
+    return request<{
+      all: Array<{
+        id: string
+        name: string
+        models: Record<string, {
+          id: string
+          name: string
+          providerID: string
+          variants?: Record<string, { disabled?: boolean }>
+        }>
+      }>
+      default?: Record<string, string>
+      connected: string[]
+    }>(config, "/provider")
   }
 }
