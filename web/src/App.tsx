@@ -972,12 +972,18 @@ function App() {
         setTodos([])
         setView("sessions")
       }
+      setPinnedDiscoveredIDs((prev) => {
+        if (!prev.has(sessionID)) return prev
+        const next = new Set(prev)
+        next.delete(sessionID)
+        return next
+      })
+      setSessions((current) => current.filter((s) => s.id !== sessionID))
       setPendingRunSince((current) => {
         if (!current[sessionID]) return current
         const { [sessionID]: _removed, ...rest } = current
         return rest
       })
-      await refreshSessions(true)
     } catch (err) {
       setRuntimeError((err as Error).message)
     }
