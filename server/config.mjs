@@ -29,13 +29,21 @@ export function getConfigPath() {
 
 export async function readRuntimeConfig() {
   const stored = await readStoredConfig()
+  const tavilyApiKey = process.env.TAVILY_API_KEY ?? stored.tavilyApiKey ?? ""
+  const braveApiKey = process.env.BRAVE_API_KEY ?? stored.braveApiKey ?? ""
   return {
     rootDir: toAbsolutePath(process.env.OPENCODE_REMOTE_ROOT_DIR ?? stored.rootDir ?? ""),
     upstreamUrl: process.env.OPENCODE_UPSTREAM_URL ?? stored.upstreamUrl ?? "http://127.0.0.1:4096",
     upstreamUsername: process.env.OPENCODE_UPSTREAM_USERNAME ?? stored.upstreamUsername ?? "opencode",
     upstreamPassword: process.env.OPENCODE_UPSTREAM_PASSWORD ?? stored.upstreamPassword ?? "",
     clientUsername: process.env.OPENCODE_REMOTE_USERNAME ?? stored.clientUsername ?? DEFAULT_CLIENT_USERNAME,
-    clientPassword: process.env.OPENCODE_REMOTE_PASSWORD ?? stored.clientPassword ?? DEFAULT_CLIENT_PASSWORD
+    clientPassword: process.env.OPENCODE_REMOTE_PASSWORD ?? stored.clientPassword ?? DEFAULT_CLIENT_PASSWORD,
+    tavilyApiKey,
+    braveApiKey,
+    researchProviders: {
+      tavily: Boolean(tavilyApiKey),
+      brave: Boolean(braveApiKey)
+    }
   }
 }
 

@@ -5,9 +5,12 @@ import type {
   HealthResponse,
   MessageEnvelope,
   PermissionRequest,
+  QuestionRequest,
+  ScheduledTask,
   ServerConfig,
   Session,
   SessionStatus,
+  TaskRun,
   TodoItem
 } from "./types"
 
@@ -191,11 +194,25 @@ export const api = {
   },
 
   getRemoteConfig(config: ServerConfig) {
-    return request<{ rootDir: string }>(config, "/remote/config")
+    return request<{ rootDir: string; researchProviders?: { tavily: boolean; brave: boolean } }>(config, "/remote/config")
   },
 
-  listManagedFolders(config: ServerConfig) {
-    return request<{ rootDir: string; folders: string[] }>(config, "/remote/folder")
+  listManagedFolders(config: ServerConfig, subdir?: string) {
+    const path = subdir ? `/remote/folder?subdir=${encodeURIComponent(subdir)}` : "/remote/folder"
+    return request<{ rootDir: string; folders: string[] }>(config, path)
+  },
+
+  discoverSessions(config: ServerConfig, folder?: string) {
+    const path = folder ? `/remote/discover-sessions?folder=${encodeURIComponent(folder)}` : "/remote/discover-sessions"
+    return request<Session[]>(config, path)
+  },
+
+  loadDiscoveredMessages(config: ServerConfig, sessionID: string) {
+    return request<MessageEnvelope[]>(config, `/remote/session/${sessionID}/message`)
+  },
+
+  loadDiscoveredTodos(config: ServerConfig, sessionID: string) {
+    return request<TodoItem[]>(config, `/remote/session/${sessionID}/todo`)
   },
 
   listSessions(config: ServerConfig) {
@@ -309,8 +326,8 @@ export const api = {
     })
   },
 
-  abort(config: ServerConfig, sessionID: string) {
-    return request<boolean>(config, `/session/${sessionID}/abort`, {
+  abort(config: ServerConfig, sessionID: string, directory?: string) {
+    return request<boolean>(config, withDirectory(`/session/${sessionID}/abort`, directory), {
       method: "POST",
       body: {}
     })
@@ -324,6 +341,17 @@ export const api = {
     return request<boolean>(config, withDirectory(`/permission/${requestID}/reply`, directory), {
       method: "POST",
       body: { reply, message }
+    })
+  },
+
+  listQuestions(config: ServerConfig) {
+    return request<QuestionRequest[]>(config, "/question")
+  },
+
+  replyQuestion(config: ServerConfig, requestID: string, reply: string) {
+    return request<boolean>(config, `/question/${requestID}/reply`, {
+      method: "POST",
+      body: { reply }
     })
   },
 
@@ -342,5 +370,29 @@ export const api = {
       default?: Record<string, string>
       connected: string[]
     }>(config, "/provider")
+  },
+
+  listTasks(config: ServerConfig) {
+    return request<ScheduledTask[]>(config, "/remote/tasks")
+  },
+
+  createTask(config: ServerConfig, body: Partial<ScheduledTask>) {
+    return request<ScheduledTask>(config, "/remote/tasks", { method: "POST", body })
+  },
+
+  updateTask(config: ServerConfig, taskID: string, patch: Partial<ScheduledTask>) {
+    return request<ScheduledTask>(config, `/remote/tasks/${taskID}`, { method: "PATCH", body: patch })
+  },
+
+  deleteTask(config: ServerConfig, taskID: string) {
+    return request<boolean>(config, `/remote/tasks/${taskID}`, { method: "DELETE" })
+  },
+
+  runTaskNow(config: ServerConfig, taskID: string) {
+    return request<{ ok: boolean }>(config, `/remote/tasks/${taskID}/run`, { method: "POST", body: {} })
+  },
+
+  listTaskHistory(config: ServerConfig, taskID: string) {
+    return request<TaskRun[]>(config, `/remote/tasks/${taskID}/history`)
   }
 }

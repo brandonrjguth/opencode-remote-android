@@ -2,6 +2,28 @@ import { createServer } from "node:http"
 import { mkdir, readdir } from "node:fs/promises"
 import path from "node:path"
 import { readRuntimeConfig, resolveManagedDirectory, updateStoredConfig } from "./config.mjs"
+import {
+  listTasks,
+  getTask,
+  createTask,
+  updateTask,
+  deleteTask,
+  listRuns
+} from "./task-store.mjs"
+import {
+  initScheduler,
+  recomputeSchedule,
+  runTaskNow,
+  recoverMissedTasks
+} from "./scheduler.mjs"
+import { searchWeb } from "./research.mjs"
+import {
+  discoverSessions as dbDiscoverSessions,
+  loadSessionMessages as dbLoadMessages,
+  loadMessageParts as dbLoadParts,
+  loadSessionTodos as dbLoadTodos,
+  getAllSessions as dbGetAllSessions
+} from "./session-db.mjs"
 
 function parseArgs(argv) {
   let hostname = process.env.OPENCODE_REMOTE_HOSTNAME ?? "0.0.0.0"
@@ -38,6 +60,11 @@ function parseBasicAuth(header) {
     username: decoded.slice(0, separator),
     password: decoded.slice(separator + 1)
   }
+}
+
+function isLoopbackRequest(req) {
+  const address = req.socket.remoteAddress
+  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1"
 }
 
 async function readBody(req) {
@@ -89,7 +116,7 @@ async function proxyToUpstream(req, res, config, override) {
 
 async function handleRemoteConfig(req, res, config) {
   if (req.method === "GET") {
-    json(res, 200, { rootDir: config.rootDir })
+    json(res, 200, { rootDir: config.rootDir, researchProviders: config.researchProviders })
     return
   }
 
@@ -108,10 +135,35 @@ async function handleRemoteConfig(req, res, config) {
 }
 
 async function handleRemoteFolder(req, res, config) {
+  if (!config.rootDir) {
+    json(res, 200, { rootDir: "", folders: [] })
+    return
+  }
+  const url = new URL(req.url ?? "/", "http://local")
+  const subdir = url.searchParams.get("subdir") ?? ""
+  const base = resolveManagedDirectory(config.rootDir, subdir)
+  const entries = await readdir(base, { withFileTypes: true }).catch(() => [])
+  const folders = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort((a, b) => a.localeCompare(b))
   json(res, 200, {
     rootDir: config.rootDir,
-    folders: await listFolders(config.rootDir)
+    folders
   })
+}
+
+async function handleRemoteWebSearch(req, res, config) {
+  if (req.method !== "POST") {
+    json(res, 405, { message: "Method not allowed" })
+    return
+  }
+
+  const body = JSON.parse((await readBody(req)).toString("utf8") || "{}")
+  const results = await searchWeb({
+    provider: typeof body.provider === "string" ? body.provider : undefined,
+    query: typeof body.query === "string" ? body.query : "",
+    count: body.count
+  }, config)
+
+  json(res, 200, { results })
 }
 
 async function handleRemoteSession(req, res, config) {
@@ -159,10 +211,138 @@ async function handleRemoteSession(req, res, config) {
   res.end(responseBody)
 }
 
+async function handleDiscoverSessions(req, res, config) {
+  if (req.method !== "GET") {
+    json(res, 405, { message: "Method not allowed" })
+    return
+  }
+  const url = new URL(req.url ?? "/", "http://local")
+  const folder = url.searchParams.get("folder") ?? ""
+  try {
+    const sessions = dbDiscoverSessions(config.rootDir, folder)
+    json(res, 200, sessions)
+  } catch (err) {
+    json(res, 200, [])
+  }
+}
+
+async function handleSessionMessages(req, res, config, sessionID) {
+  if (req.method !== "GET") {
+    json(res, 405, { message: "Method not allowed" })
+    return
+  }
+  try {
+    const messages = dbLoadMessages(sessionID)
+    const partsByMessage = dbLoadParts(sessionID)
+    const envelopes = messages.map((msg) => ({
+      ...msg,
+      parts: partsByMessage[msg.info.id] || []
+    }))
+    json(res, 200, envelopes)
+  } catch (err) {
+    json(res, 200, [])
+  }
+}
+
+async function handleSessionTodos(req, res, config, sessionID) {
+  if (req.method !== "GET") {
+    json(res, 405, { message: "Method not allowed" })
+    return
+  }
+  try {
+    const todos = dbLoadTodos(sessionID)
+    json(res, 200, todos)
+  } catch (err) {
+    json(res, 200, [])
+  }
+}
+
+async function handleRemoteTasks(req, res, config, url) {
+  const match = url.pathname.match(/^\/remote\/tasks\/([\w-]+)(\/history)?$/)
+
+  if (match) {
+    const taskID = match[1]
+    const isHistory = Boolean(match[2])
+
+    if (isHistory) {
+      if (req.method !== "GET") {
+        json(res, 405, { message: "Method not allowed" })
+        return
+      }
+      const runs = await listRuns(taskID)
+      json(res, 200, runs)
+      return
+    }
+
+    if (req.method === "GET") {
+      const task = await getTask(taskID)
+      if (!task) { json(res, 404, { message: "Task not found" }); return }
+      json(res, 200, task)
+      return
+    }
+
+    if (req.method === "PATCH") {
+      const body = JSON.parse((await readBody(req)).toString("utf8") || "{}")
+      const updated = await updateTask(taskID, body)
+      if (!updated) { json(res, 404, { message: "Task not found" }); return }
+      recomputeSchedule().catch(() => undefined)
+      json(res, 200, updated)
+      return
+    }
+
+    if (req.method === "DELETE") {
+      const deleted = await deleteTask(taskID)
+      if (!deleted) { json(res, 404, { message: "Task not found" }); return }
+      recomputeSchedule().catch(() => undefined)
+      json(res, 200, { ok: true })
+      return
+    }
+
+    json(res, 405, { message: "Method not allowed" })
+    return
+  }
+
+  if (url.pathname.match(/^\/remote\/tasks\/([\w-]+)\/run$/)) {
+    const taskID = url.pathname.split("/")[3]
+    if (req.method !== "POST") {
+      json(res, 405, { message: "Method not allowed" })
+      return
+    }
+    try {
+      runTaskNow(taskID).catch(() => undefined)
+      json(res, 200, { ok: true, message: "Task started" })
+    } catch (err) {
+      json(res, 400, { message: err instanceof Error ? err.message : String(err) })
+    }
+    return
+  }
+
+  if (url.pathname === "/remote/tasks") {
+    if (req.method === "GET") {
+      const tasks = await listTasks()
+      json(res, 200, tasks)
+      return
+    }
+
+    if (req.method === "POST") {
+      const body = JSON.parse((await readBody(req)).toString("utf8") || "{}")
+      const task = await createTask(body)
+      recomputeSchedule().catch(() => undefined)
+      json(res, 201, task)
+      return
+    }
+
+    json(res, 405, { message: "Method not allowed" })
+    return
+  }
+}
+
 async function requestHandler(req, res) {
   const config = await readRuntimeConfig()
+  const url = new URL(req.url ?? "/", "http://local")
+  const localToolRequest = url.pathname === "/remote/tools/web-search" && isLoopbackRequest(req)
   const needsAuth = Boolean(config.clientPassword)
-  if (needsAuth) {
+  if (needsAuth && !localToolRequest) {
     const auth = parseBasicAuth(req.headers.authorization)
     if (!auth || auth.username !== config.clientUsername || auth.password !== config.clientPassword) {
       unauthorized(res)
@@ -171,8 +351,6 @@ async function requestHandler(req, res) {
   }
 
   try {
-    const url = new URL(req.url ?? "/", "http://local")
-
     if (url.pathname === "/remote/config") {
       await handleRemoteConfig(req, res, config)
       return
@@ -185,6 +363,33 @@ async function requestHandler(req, res) {
 
     if (url.pathname === "/remote/session") {
       await handleRemoteSession(req, res, config)
+      return
+    }
+
+    if (url.pathname === "/remote/tools/web-search") {
+      await handleRemoteWebSearch(req, res, config)
+      return
+    }
+
+    if (url.pathname.startsWith("/remote/tasks")) {
+      await handleRemoteTasks(req, res, config, url)
+      return
+    }
+
+    if (url.pathname === "/remote/discover-sessions") {
+      await handleDiscoverSessions(req, res, config)
+      return
+    }
+
+    const msgMatch = url.pathname.match(/^\/remote\/session\/([\w-]+)\/message$/)
+    if (msgMatch) {
+      await handleSessionMessages(req, res, config, msgMatch[1])
+      return
+    }
+
+    const todoMatch = url.pathname.match(/^\/remote\/session\/([\w-]+)\/todo$/)
+    if (todoMatch) {
+      await handleSessionTodos(req, res, config, todoMatch[1])
       return
     }
 
@@ -205,4 +410,6 @@ const server = createServer((req, res) => {
 
 server.listen(port, hostname, () => {
   process.stdout.write(`OpenCode Remote wrapper listening on http://${hostname}:${port}\n`)
+  initScheduler(readRuntimeConfig)
+  recoverMissedTasks().catch(() => undefined)
 })

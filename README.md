@@ -37,9 +37,20 @@ If this machine uses `systemd`, you can run the one-shot installer from the repo
 npm run setup:linux
 ```
 
+You can safely rerun this command later to update credentials, the managed root, or live research API keys. The installer stops this repo's existing user services, rewrites the environment files, and starts them again.
+
+To update only the live research API keys later, run:
+
+```bash
+npm run setup:research
+```
+
+It updates `.runtime/opencode-remote.env` and restarts only the wrapper service.
+
 It will:
 
 - prompt for the shared username and password
+- optionally prompt for Tavily and Brave Search API keys for live research tasks
 - configure OpenCode on `127.0.0.1:4096`
 - configure the wrapper on `0.0.0.0:4097`
 - save the managed root directory in `server-config.json`
@@ -91,6 +102,13 @@ If you want the wrapper itself protected with Basic Auth, also set:
 
 ```bash
 OPENCODE_REMOTE_USERNAME=opencode OPENCODE_REMOTE_PASSWORD=your-password
+```
+
+If you want scheduled tasks to support live web research, also set either or both:
+
+```bash
+TAVILY_API_KEY=your-tavily-key
+BRAVE_API_KEY=your-brave-search-key
 ```
 
 ### 4. Point the Android app at the wrapper

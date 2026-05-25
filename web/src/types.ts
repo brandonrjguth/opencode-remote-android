@@ -102,6 +102,14 @@ export type PermissionRequest = {
 
 export type PermissionReply = "once" | "always" | "reject"
 
+export type QuestionRequest = {
+  id: string
+  sessionID: string
+  question: string
+  metadata: Record<string, unknown>
+  tool?: { messageID: string; callID: string }
+}
+
 export type TodoItem = {
   content: string
   status: string
@@ -133,4 +141,40 @@ export type SessionView = {
 export type CommandInfo = {
   name: string
   description?: string
+}
+
+export type ScheduledTask = {
+  id: string
+  title: string
+  prompt: string
+  folder: string
+  repeat: "once" | "daily" | "weekly" | "monthly"
+  scheduledTime: string | null
+  dayOfWeek: number | null
+  dayOfMonth: number | null
+  model: { providerID: string; modelID: string; variant?: string } | null
+  variant: string | null
+  liveWebResearch: boolean
+  searchProvider: "tavily" | "brave" | null
+  searchQuery: string
+  enabled: boolean
+  createdAt: number
+  updatedAt: number
+  lastRunAt: number | null
+  nextRunAt: number | null
+  running: boolean
+}
+
+export type TaskRun = {
+  id: string
+  taskID: string
+  startedAt: number
+  finishedAt: number | null
+  status: "running" | "completed" | "error"
+  prompt: string
+  model: { providerID: string; modelID: string; variant?: string } | null
+  variant: string | null
+  folder: string
+  responseText: string | null
+  error: string | null
 }

@@ -4,8 +4,11 @@ import type {
   MessageEnvelope,
   MessagePart,
   PermissionRequest,
+  QuestionRequest,
+  ScheduledTask,
   ServerConfig,
   SessionView,
+  TaskRun,
   TodoItem
 } from "./types"
 import {
@@ -21,11 +24,13 @@ import {
   LoadingIcon,
   RocketIcon,
   MenuIcon,
-  BackIcon
+  BackIcon,
+  ClockIcon
 } from "./Icons"
 
 const STORAGE_KEY = "opencode.remote.server"
-const PENDING_RUN_TTL_MS = 20_000
+const THEME_STORAGE_KEY = "opencode.remote.theme"
+const PENDING_RUN_TTL_MS = 600_000
 const SILENT_RUNTIME_ERROR_PERSIST_MS = 10_000
 const PRIMARY_AGENTS = ["build", "plan"] as const
 
@@ -34,6 +39,7 @@ type SelectedModel = { providerID: string; modelID: string; variant?: string } |
 type ModelOption = { id: string; name: string; providerID: string; variants: string[] }
 type BasicModelRef = { providerID: string; modelID: string }
 type PrimaryAgent = (typeof PRIMARY_AGENTS)[number]
+type ThemePreference = "system" | "dark" | "light"
 
 const defaultConfig: ServerConfig = {
   host: "",
@@ -45,6 +51,34 @@ const defaultConfig: ServerConfig = {
 function formatTime(epoch: number): string {
   if (!epoch) return "-"
   return new Date(epoch).toLocaleString()
+}
+
+function formatTaskSchedule(task: ScheduledTask): string {
+  const time = task.scheduledTime ? ` at ${task.scheduledTime}` : ""
+  if (task.repeat === "weekly") {
+    const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    return `Weekly on ${days[task.dayOfWeek ?? 0]}${time}`
+  }
+  if (task.repeat === "monthly") {
+    return `Monthly on day ${task.dayOfMonth ?? 1}${time}`
+  }
+  if (task.repeat === "daily") {
+    return `Daily${time}`
+  }
+  return `Once${time}`
+}
+
+function formatDirectoryLabel(directory: string, rootDirectory: string): string {
+  const normalizedDirectory = directory.replace(/\/+$/g, "")
+  const normalizedRoot = rootDirectory.replace(/\/+$/g, "")
+  if (!normalizedDirectory || (normalizedRoot && normalizedDirectory === normalizedRoot)) return "Root"
+
+  if (normalizedRoot && normalizedDirectory.startsWith(`${normalizedRoot}/`)) {
+    return normalizedDirectory.slice(normalizedRoot.length + 1) || "Root"
+  }
+
+  const parts = normalizedDirectory.split("/").filter(Boolean)
+  return parts[parts.length - 1] ?? "Root"
 }
 
 function extractText(msg: MessageEnvelope): string {
@@ -76,44 +110,142 @@ function hasRenderableContent(msg: MessageEnvelope): boolean {
   })
 }
 
-function renderInline(text: string) {
-  const codeChunks = text.split(/(`[^`]+`)/g)
-  return codeChunks.map((chunk, index) => {
-    if (chunk.startsWith("`") && chunk.endsWith("`")) {
-      return <code key={`code-${index}`}>{chunk.slice(1, -1)}</code>
-    }
-
-    const nodes = []
-    const boldPattern = /\*\*(.+?)\*\*/g
-    let cursor = 0
-    let match: RegExpExecArray | null = boldPattern.exec(chunk)
-
-    while (match) {
-      if (match.index > cursor) {
-        nodes.push(<span key={`text-${index}-${cursor}`}>{chunk.slice(cursor, match.index)}</span>)
-      }
-      nodes.push(<strong key={`bold-${index}-${match.index}`}>{match[1]}</strong>)
-      cursor = match.index + match[0].length
-      match = boldPattern.exec(chunk)
-    }
-
-    if (cursor < chunk.length) {
-      nodes.push(<span key={`tail-${index}-${cursor}`}>{chunk.slice(cursor)}</span>)
-    }
-
-    if (nodes.length === 0) {
-      return <span key={`empty-${index}`}>{chunk}</span>
-    }
-    return <span key={`inline-${index}`}>{nodes}</span>
-  })
+function trimTrailingUrlPunctuation(value: string) {
+  return value.replace(/[),.;!?]+$/g, "")
 }
 
-function toDisplayLines(text: string): string[] {
-  const normalized = text.includes("\n") ? text : text.replace(/\s-\s(?=\S)/g, "\n- ")
-  return normalized
-    .split("\n")
-    .map((line) => line.trimEnd())
-    .filter((line, idx, arr) => line.length > 0 || (idx > 0 && arr[idx - 1].length > 0))
+function renderInline(text: string, keyPrefix = "inline") {
+  const pattern = /(\[[^\]]+\]\((https?:\/\/[^\s)]+)\)|https?:\/\/[^\s<]+|`[^`]+`|\*\*[^*]+\*\*)/g
+  const nodes = []
+  let cursor = 0
+  let match: RegExpExecArray | null = pattern.exec(text)
+
+  while (match) {
+    const token = match[0]
+    if (match.index > cursor) {
+      nodes.push(<span key={`${keyPrefix}-text-${cursor}`}>{text.slice(cursor, match.index)}</span>)
+    }
+
+    if (token.startsWith("`") && token.endsWith("`")) {
+      nodes.push(<code key={`${keyPrefix}-code-${match.index}`}>{token.slice(1, -1)}</code>)
+    } else if (token.startsWith("**") && token.endsWith("**")) {
+      nodes.push(<strong key={`${keyPrefix}-bold-${match.index}`}>{token.slice(2, -2)}</strong>)
+    } else if (token.startsWith("[")) {
+      const labelEnd = token.indexOf("](")
+      const label = token.slice(1, labelEnd)
+      const href = token.slice(labelEnd + 2, -1)
+      nodes.push(
+        <a key={`${keyPrefix}-link-${match.index}`} href={href} target="_blank" rel="noreferrer">
+          {label}
+        </a>
+      )
+    } else {
+      const href = trimTrailingUrlPunctuation(token)
+      const trailing = token.slice(href.length)
+      nodes.push(
+        <a key={`${keyPrefix}-url-${match.index}`} href={href} target="_blank" rel="noreferrer">
+          {href}
+        </a>
+      )
+      if (trailing) {
+        nodes.push(<span key={`${keyPrefix}-trail-${match.index}`}>{trailing}</span>)
+      }
+    }
+
+    cursor = match.index + token.length
+    match = pattern.exec(text)
+  }
+
+  if (cursor < text.length) {
+    nodes.push(<span key={`${keyPrefix}-tail-${cursor}`}>{text.slice(cursor)}</span>)
+  }
+
+  if (nodes.length === 0) return <span key={`${keyPrefix}-empty`}>{text}</span>
+  return nodes
+}
+
+function renderRichText(text: string, keyPrefix = "rich") {
+  const normalized = text.replace(/\r\n?/g, "\n")
+  const lines = normalized.split("\n")
+  const blocks = []
+  let index = 0
+
+  while (index < lines.length) {
+    const line = lines[index]
+    const trimmed = line.trim()
+
+    if (!trimmed) {
+      index += 1
+      continue
+    }
+
+    if (trimmed.startsWith("```")) {
+      const codeLines = []
+      index += 1
+      while (index < lines.length && !lines[index].trim().startsWith("```")) {
+        codeLines.push(lines[index])
+        index += 1
+      }
+      if (index < lines.length) index += 1
+      blocks.push(<pre key={`${keyPrefix}-code-${blocks.length}`}><code>{codeLines.join("\n")}</code></pre>)
+      continue
+    }
+
+    const headingMatch = trimmed.match(/^(#{1,3})\s+(.+)$/)
+    if (headingMatch) {
+      const Tag = headingMatch[1].length === 1 ? "h2" : headingMatch[1].length === 2 ? "h3" : "h4"
+      blocks.push(<Tag key={`${keyPrefix}-heading-${blocks.length}`}>{renderInline(headingMatch[2], `${keyPrefix}-heading-${blocks.length}`)}</Tag>)
+      index += 1
+      continue
+    }
+
+    if (/^[-*]\s+/.test(trimmed)) {
+      const items = []
+      while (index < lines.length && /^[-*]\s+/.test(lines[index].trim())) {
+        items.push(lines[index].trim().replace(/^[-*]\s+/, ""))
+        index += 1
+      }
+      blocks.push(
+        <ul key={`${keyPrefix}-ul-${blocks.length}`}>
+          {items.map((item, itemIndex) => <li key={`${keyPrefix}-ul-item-${itemIndex}`}>{renderInline(item, `${keyPrefix}-ul-${itemIndex}`)}</li>)}
+        </ul>
+      )
+      continue
+    }
+
+    if (/^\d+\.\s+/.test(trimmed)) {
+      const items = []
+      while (index < lines.length && /^\d+\.\s+/.test(lines[index].trim())) {
+        items.push(lines[index].trim().replace(/^\d+\.\s+/, ""))
+        index += 1
+      }
+      blocks.push(
+        <ol key={`${keyPrefix}-ol-${blocks.length}`}>
+          {items.map((item, itemIndex) => <li key={`${keyPrefix}-ol-item-${itemIndex}`}>{renderInline(item, `${keyPrefix}-ol-${itemIndex}`)}</li>)}
+        </ol>
+      )
+      continue
+    }
+
+    const paragraphLines = [trimmed]
+    index += 1
+    while (index < lines.length) {
+      const next = lines[index].trim()
+      if (!next || next.startsWith("```") || /^(#{1,3})\s+/.test(next) || /^[-*]\s+/.test(next) || /^\d+\.\s+/.test(next)) {
+        break
+      }
+      paragraphLines.push(next)
+      index += 1
+    }
+
+    blocks.push(
+      <p key={`${keyPrefix}-p-${blocks.length}`}>
+        {renderInline(paragraphLines.join(" "), `${keyPrefix}-p-${blocks.length}`)}
+      </p>
+    )
+  }
+
+  return blocks
 }
 
 function toolStatusLabel(status: string) {
@@ -140,8 +272,12 @@ function App() {
   })
 
   const [draftConfig, setDraftConfig] = useState<ServerConfig>(config)
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
+    const saved = localStorage.getItem(THEME_STORAGE_KEY)
+    return saved === "dark" || saved === "light" || saved === "system" ? saved : "system"
+  })
   const [connectedVersion, setConnectedVersion] = useState<string>("")
-  const [view, setView] = useState<"settings" | "sessions" | "detail">(() => {
+  const [view, setView] = useState<"settings" | "sessions" | "detail" | "tasks">(() => {
     return config.host && config.port > 0 ? "sessions" : "settings"
   })
   const [menuOpen, setMenuOpen] = useState(false)
@@ -160,16 +296,21 @@ function App() {
   const [settingsNotice, setSettingsNotice] = useState<{ type: NoticeType; text: string } | null>(null)
   const [runtimeError, setRuntimeError] = useState<string | null>(null)
   const messagesRef = useRef<HTMLDivElement | null>(null)
+  const taskMessagesRef = useRef<HTMLDivElement | null>(null)
   const composerRef = useRef<HTMLTextAreaElement | null>(null)
   const completionAudioRef = useRef<HTMLAudioElement | null>(null)
   const wasRunningRef = useRef(false)
   const appVisibleRef = useRef(true)
+  const loadGenerationRef = useRef(0)
   const resumeSuppressUntilRef = useRef(0)
   const delayedErrorTimerRef = useRef<number | null>(null)
   const silentRuntimeErrorRef = useRef<{ message: string; since: number } | null>(null)
 
   const [permissions, setPermissions] = useState<PermissionRequest[]>([])
+  const [questions, setQuestions] = useState<QuestionRequest[]>([])
   const [replyingPermID, setReplyingPermID] = useState<string | null>(null)
+  const [replyingQuestionID, setReplyingQuestionID] = useState<string | null>(null)
+  const [questionAnswer, setQuestionAnswer] = useState("")
   const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({})
   const [expandedToolOutput, setExpandedToolOutput] = useState<Record<string, boolean>>({})
   const [models, setModels] = useState<ModelOption[]>([])
@@ -182,6 +323,7 @@ function App() {
   const [pendingRunSince, setPendingRunSince] = useState<Record<string, number>>({})
   const pendingRunSinceRef = useRef<Record<string, number>>({})
   const [renamingSessionID, setRenamingSessionID] = useState<string | null>(null)
+  const [sessionMenuID, setSessionMenuID] = useState<string | null>(null)
   const [renameDraft, setRenameDraft] = useState("")
   const [defaultModel, setDefaultModel] = useState<BasicModelRef | null>(null)
   const [selectedAgent, setSelectedAgent] = useState<PrimaryAgent | null>(null)
@@ -189,13 +331,54 @@ function App() {
   const [managedFolders, setManagedFolders] = useState<string[]>([])
   const [managedSessionOpen, setManagedSessionOpen] = useState(false)
   const [managedSessionFolder, setManagedSessionFolder] = useState("")
+  const [managedSessionTitle, setManagedSessionTitle] = useState("")
+  const [managedFolderBrowsePath, setManagedFolderBrowsePath] = useState<string[]>([])
+  const [selectedManagedSessionID, setSelectedManagedSessionID] = useState<string | null>(null)
+  const [discoveredSessions, setDiscoveredSessions] = useState<SessionView[]>([])
+  const [pinnedDiscoveredIDs, setPinnedDiscoveredIDs] = useState<Set<string>>(new Set())
   const [loadingManagedFolders, setLoadingManagedFolders] = useState(false)
   const [creatingManagedSession, setCreatingManagedSession] = useState(false)
+  const [discoverExpanded, setDiscoverExpanded] = useState(false)
+
+  const [tasks, setTasks] = useState<ScheduledTask[]>([])
+  const [taskHistory, setTaskHistory] = useState<TaskRun[]>([])
+  const [taskFormOpen, setTaskFormOpen] = useState(false)
+  const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null)
+  const [viewingTaskID, setViewingTaskID] = useState<string | null>(null)
+  const [taskFormTitle, setTaskFormTitle] = useState("")
+  const [taskFormPrompt, setTaskFormPrompt] = useState("")
+  const [taskFormFolder, setTaskFormFolder] = useState("")
+  const [taskFormRepeat, setTaskFormRepeat] = useState<"once" | "daily" | "weekly" | "monthly">("daily")
+  const [taskFormTime, setTaskFormTime] = useState("09:00")
+  const [taskFormDayOfWeek, setTaskFormDayOfWeek] = useState<number>(1)
+  const [taskFormDayOfMonth, setTaskFormDayOfMonth] = useState<number>(1)
+  const [taskFormModel, setTaskFormModel] = useState<{ providerID: string; modelID: string } | null>(null)
+  const [taskFormVariant, setTaskFormVariant] = useState<string | null>(null)
+  const [taskFormLiveWebResearch, setTaskFormLiveWebResearch] = useState(false)
+  const [taskFormSearchProvider, setTaskFormSearchProvider] = useState<"tavily" | "brave">("tavily")
+  const [taskModels, setTaskModels] = useState<ModelOption[]>([])
+  const [savingTask, setSavingTask] = useState(false)
+  const [researchProviders, setResearchProviders] = useState({ tavily: false, brave: false })
 
   const selectedSession = useMemo(
     () => sessions.find((session) => session.id === selectedID) ?? null,
     [sessions, selectedID]
   )
+
+  const selectedTask = useMemo(
+    () => tasks.find((task) => task.id === viewingTaskID) ?? null,
+    [tasks, viewingTaskID]
+  )
+
+  const orderedTaskHistory = useMemo(
+    () => [...taskHistory].sort((a, b) => a.startedAt - b.startedAt),
+    [taskHistory]
+  )
+
+  const selectedTaskModelInfo = useMemo(() => {
+    if (!taskFormModel) return null
+    return taskModels.find((model) => model.id === taskFormModel.modelID && model.providerID === taskFormModel.providerID) ?? null
+  }, [taskFormModel, taskModels])
 
   const filteredSessions = useMemo(() => {
     const text = query.trim().toLowerCase()
@@ -219,6 +402,11 @@ function App() {
     if (!selectedSession) return []
     return permissions.filter((p) => p.sessionID === selectedSession.id)
   }, [permissions, selectedSession])
+
+  const sessionQuestions = useMemo(() => {
+    if (!selectedSession) return []
+    return questions.filter((q) => q.sessionID === selectedSession.id)
+  }, [questions, selectedSession])
 
   const lastUsedModel = useMemo(() => {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -303,9 +491,46 @@ function App() {
   }, [pendingRunSince])
 
   useEffect(() => {
+    const root = document.documentElement
+    const media = window.matchMedia("(prefers-color-scheme: light)")
+
+    const applyTheme = () => {
+      const resolved = themePreference === "system"
+        ? media.matches ? "light" : "dark"
+        : themePreference
+      root.dataset.theme = resolved
+    }
+
+    applyTheme()
+    localStorage.setItem(THEME_STORAGE_KEY, themePreference)
+
+    if (themePreference !== "system") return () => undefined
+    media.addEventListener("change", applyTheme)
+    return () => media.removeEventListener("change", applyTheme)
+  }, [themePreference])
+
+  useEffect(() => {
     if (!selectedSession) return
     setThinkingLevel(selectedSession.variant ?? null)
+    setSelectedModel(null)
   }, [selectedSession?.id])
+
+  useEffect(() => {
+    if (!managedSessionOpen) return
+    discoverSessions(managedSessionFolder).catch(() => undefined)
+  }, [managedSessionOpen, managedSessionFolder])
+
+  useEffect(() => {
+    if (taskFormSearchProvider === "tavily" && researchProviders.tavily) return
+    if (taskFormSearchProvider === "brave" && researchProviders.brave) return
+    if (researchProviders.tavily) {
+      setTaskFormSearchProvider("tavily")
+      return
+    }
+    if (researchProviders.brave) {
+      setTaskFormSearchProvider("brave")
+    }
+  }, [researchProviders.brave, researchProviders.tavily, taskFormSearchProvider])
 
   useEffect(() => {
     if (!selectedSession) return
@@ -466,7 +691,11 @@ function App() {
           variant: session.model?.variant
         }))
         .sort((a, b) => b.updated - a.updated)
-      setSessions(mapped)
+      setSessions((prev) => {
+        const upstreamIDs = new Set(mapped.map((s) => s.id))
+        const pinned = prev.filter((s) => pinnedDiscoveredIDs.has(s.id) && !upstreamIDs.has(s.id))
+        return [...mapped, ...pinned]
+      })
       setPendingRunSince((current) => {
         const next: Record<string, number> = {}
         const activeIDs = new Set(items.map((session) => session.id))
@@ -492,18 +721,42 @@ function App() {
   async function refreshPermissions() {
     if (!config.host || !config.password) return
     try {
-      const list = await api.listPermissions(config, selectedSession?.directory)
+      const list = await api.listPermissions(config)
       setPermissions(list)
     } catch {
       // silent
     }
   }
 
-  async function loadManagedFolders() {
+  async function refreshQuestions() {
+    if (!config.host || !config.password) return
+    try {
+      const list = await api.listQuestions(config)
+      setQuestions(list)
+    } catch {
+      // silent
+    }
+  }
+
+  async function loadRemoteConfig() {
+    if (!config.host || !config.password) return
+    try {
+      const data = await api.getRemoteConfig(config)
+      setManagedRootDir(data.rootDir)
+      setResearchProviders({
+        tavily: Boolean(data.researchProviders?.tavily),
+        brave: Boolean(data.researchProviders?.brave)
+      })
+    } catch {
+      // silent
+    }
+  }
+
+  async function loadManagedFolders(subdir = "") {
     if (!config.host || !config.password) return
     setLoadingManagedFolders(true)
     try {
-      const data = await api.listManagedFolders(config)
+      const data = await api.listManagedFolders(config, subdir || undefined)
       setManagedRootDir(data.rootDir)
       setManagedFolders(data.folders)
     } catch (err) {
@@ -513,9 +766,39 @@ function App() {
     }
   }
 
+  async function discoverSessions(folder = "") {
+    if (!config.host || !config.password) return
+    try {
+      const items = await api.discoverSessions(config, folder || undefined)
+      setDiscoveredSessions(
+        items.map((s) => ({
+          id: s.id,
+          title: s.title,
+          directory: s.directory,
+          agent: s.agent,
+          updated: s.time.updated,
+          status: "idle",
+          files: s.summary?.files ?? 0,
+          additions: s.summary?.additions ?? 0,
+          deletions: s.summary?.deletions ?? 0,
+          modelID: s.model?.id,
+          providerID: s.model?.providerID,
+          variant: s.model?.variant
+        }))
+      )
+    } catch {
+      setDiscoveredSessions([])
+    }
+  }
+
   function openManagedSessionPanel() {
     setManagedSessionOpen(true)
     setManagedSessionFolder("")
+    setManagedSessionTitle("")
+    setManagedFolderBrowsePath([])
+    setSelectedManagedSessionID(null)
+    setDiscoveredSessions([])
+    setDiscoverExpanded(false)
     loadManagedFolders().catch(() => undefined)
   }
 
@@ -585,15 +868,18 @@ function App() {
 
   async function loadSelected(sessionID: string, directory: string, silent = false) {
     if (!silent) clearSilentRuntimeError()
+    const gen = ++loadGenerationRef.current
     try {
       const [msg, todo] = await Promise.all([
         api.loadMessages(config, sessionID, directory),
         api.loadTodo(config, sessionID)
       ])
+      if (loadGenerationRef.current !== gen) return
       setMessages(msg)
       setTodos(todo)
       if (silent) clearSilentRuntimeError()
     } catch (err) {
+      if (loadGenerationRef.current !== gen) return
       if (!shouldSuppressSilentErrors(silent)) {
         if (silent) setSilentRuntimeError((err as Error).message)
         else setRuntimeError((err as Error).message)
@@ -605,7 +891,7 @@ function App() {
     setCreatingManagedSession(true)
     try {
       const created = await api.createManagedSession(config, {
-        title: "Mobile session",
+        title: managedSessionTitle.trim() || undefined,
         folder: managedSessionFolder.trim() || undefined,
         agent: activeAgent,
         model: activeModel ?? undefined
@@ -638,9 +924,10 @@ function App() {
         const args = normalized.slice(command.length).trim()
         if (!command) return
         if (command === "new") {
+          const title = args || undefined
           const created = await api.createSession(
             config,
-            "Mobile session",
+            title,
             selectedSession.directory,
             activeAgent,
             activeModel ?? undefined
@@ -679,6 +966,7 @@ function App() {
     try {
       await api.deleteSession(config, sessionID)
       if (selectedID === sessionID) {
+        loadGenerationRef.current++
         setSelectedID(null)
         setMessages([])
         setTodos([])
@@ -696,11 +984,13 @@ function App() {
   }
 
   function beginRenameSession(session: SessionView) {
+    setSessionMenuID(null)
     setRenamingSessionID(session.id)
     setRenameDraft(session.title)
   }
 
   function cancelRenameSession() {
+    setSessionMenuID(null)
     setRenamingSessionID(null)
     setRenameDraft("")
   }
@@ -724,15 +1014,28 @@ function App() {
   async function abortSession() {
     if (!selectedSession) return
     try {
-      await api.abort(config, selectedSession.id)
+      await api.abort(config, selectedSession.id, selectedSession.directory)
+      setSendingSessionID(null)
       setPendingRunSince((current) => {
         if (!current[selectedSession.id]) return current
         const { [selectedSession.id]: _removed, ...rest } = current
         return rest
       })
+      setSessions((current) =>
+        current.map((s) => s.id === selectedSession.id ? { ...s, status: "idle" } : s)
+      )
       await refreshSessions()
       await loadSelected(selectedSession.id, selectedSession.directory)
     } catch (err) {
+      setSendingSessionID(null)
+      setPendingRunSince((current) => {
+        if (!current[selectedSession.id]) return current
+        const { [selectedSession.id]: _removed, ...rest } = current
+        return rest
+      })
+      setSessions((current) =>
+        current.map((s) => s.id === selectedSession.id ? { ...s, status: "idle" } : s)
+      )
       setRuntimeError((err as Error).message)
     }
   }
@@ -740,7 +1043,7 @@ function App() {
   async function replyPermission(requestID: string, reply: string) {
     setReplyingPermID(requestID)
     try {
-      await api.replyPermission(config, requestID, reply, undefined, selectedSession?.directory)
+      await api.replyPermission(config, requestID, reply)
       await refreshPermissions()
       if (selectedSession) {
         await loadSelected(selectedSession.id, selectedSession.directory)
@@ -753,6 +1056,25 @@ function App() {
     }
   }
 
+  async function replyQuestion(requestID: string) {
+    const answer = questionAnswer.trim()
+    if (!answer) return
+    setReplyingQuestionID(requestID)
+    try {
+      await api.replyQuestion(config, requestID, answer)
+      setQuestionAnswer("")
+      await refreshQuestions()
+      if (selectedSession) {
+        await loadSelected(selectedSession.id, selectedSession.directory)
+        await refreshSessions(true)
+      }
+    } catch (err) {
+      setRuntimeError((err as Error).message)
+    } finally {
+      setReplyingQuestionID(null)
+    }
+  }
+
   function toggleThinking(partID: string) {
     setExpandedThinking((prev) => ({ ...prev, [partID]: !prev[partID] }))
   }
@@ -761,19 +1083,182 @@ function App() {
     setExpandedToolOutput((prev) => ({ ...prev, [partID]: !prev[partID] }))
   }
 
+  async function refreshTasks() {
+    if (!config.host || !config.password) return
+    try {
+      const data = await api.listTasks(config)
+      setTasks(data)
+    } catch {
+      // silent
+    }
+  }
+
+  async function loadTaskHistory(taskID: string) {
+    if (!config.host || !config.password) return
+    try {
+      const data = await api.listTaskHistory(config, taskID)
+      setTaskHistory(data)
+    } catch {
+      // silent
+    }
+  }
+
+  async function fetchTaskModels() {
+    if (!config.host || !config.password) return
+    try {
+      const data = await api.listProviders(config)
+      const connectedSet = new Set(data.connected as string[])
+      const modelList: ModelOption[] = []
+      for (const provider of data.all) {
+        if (!connectedSet.has(provider.id)) continue
+        for (const model of Object.values(provider.models)) {
+          modelList.push({
+            id: model.id,
+            name: model.name || model.id,
+            providerID: model.providerID || provider.id,
+            variants: Object.entries(model.variants ?? {})
+              .filter(([, variant]) => !variant?.disabled)
+              .map(([variant]) => variant)
+          })
+        }
+      }
+      setTaskModels(modelList)
+    } catch {
+      // silent
+    }
+  }
+
+  function openTaskForm(task?: ScheduledTask) {
+    if (task) {
+      setEditingTask(task)
+      setTaskFormTitle(task.title)
+      setTaskFormPrompt(task.prompt)
+      setTaskFormFolder(task.folder)
+      setTaskFormRepeat(task.repeat)
+      setTaskFormTime(task.scheduledTime ?? "09:00")
+      setTaskFormDayOfWeek(task.dayOfWeek ?? 1)
+      setTaskFormDayOfMonth(task.dayOfMonth ?? 1)
+      setTaskFormModel(task.model ? { providerID: task.model.providerID, modelID: task.model.modelID } : null)
+      setTaskFormVariant(task.variant)
+      setTaskFormLiveWebResearch(task.liveWebResearch)
+      setTaskFormSearchProvider(task.searchProvider ?? (researchProviders.tavily ? "tavily" : "brave"))
+      const browsePath = (task.folder ?? "").split("/").filter(Boolean)
+      setManagedFolderBrowsePath(browsePath)
+      setTaskFormOpen(true)
+      fetchTaskModels().catch(() => undefined)
+      loadManagedFolders(browsePath.slice(0, -1).join("/")).catch(() => undefined)
+      loadRemoteConfig().catch(() => undefined)
+    } else {
+      setEditingTask(null)
+      setTaskFormTitle("")
+      setTaskFormPrompt("")
+      setTaskFormFolder("")
+      setTaskFormRepeat("daily")
+      setTaskFormTime("09:00")
+      setTaskFormDayOfWeek(1)
+      setTaskFormDayOfMonth(1)
+      setTaskFormModel(null)
+      setTaskFormVariant(null)
+      setTaskFormLiveWebResearch(false)
+      setTaskFormSearchProvider(researchProviders.tavily ? "tavily" : "brave")
+    }
+    setTaskFormOpen(true)
+    setManagedFolderBrowsePath([])
+    fetchTaskModels().catch(() => undefined)
+    loadManagedFolders().catch(() => undefined)
+    loadRemoteConfig().catch(() => undefined)
+  }
+
+  async function saveTask() {
+    setSavingTask(true)
+    try {
+      const body = {
+        title: taskFormTitle.trim(),
+        prompt: taskFormPrompt.trim(),
+        folder: taskFormFolder.trim(),
+        repeat: taskFormRepeat,
+        scheduledTime: taskFormTime,
+        dayOfWeek: taskFormRepeat === "weekly" ? taskFormDayOfWeek : null,
+        dayOfMonth: taskFormRepeat === "monthly" ? taskFormDayOfMonth : null,
+        model: taskFormModel ? { ...taskFormModel, variant: taskFormVariant ?? undefined } : null,
+        variant: taskFormVariant,
+        liveWebResearch: taskFormLiveWebResearch,
+        searchProvider: taskFormLiveWebResearch ? taskFormSearchProvider : null,
+        searchQuery: ""
+      }
+      if (editingTask) {
+        await api.updateTask(config, editingTask.id, body)
+      } else {
+        await api.createTask(config, body)
+      }
+      setTaskFormOpen(false)
+      setEditingTask(null)
+      await refreshTasks()
+    } catch (err) {
+      setRuntimeError((err as Error).message)
+    } finally {
+      setSavingTask(false)
+    }
+  }
+
+  async function deleteTaskAction(taskID: string) {
+    try {
+      await api.deleteTask(config, taskID)
+      if (viewingTaskID === taskID) {
+        setViewingTaskID(null)
+        setTaskHistory([])
+      }
+      await refreshTasks()
+    } catch (err) {
+      setRuntimeError((err as Error).message)
+    }
+  }
+
+  async function toggleTaskEnabled(task: ScheduledTask) {
+    try {
+      await api.updateTask(config, task.id, { enabled: !task.enabled })
+      await refreshTasks()
+    } catch (err) {
+      setRuntimeError((err as Error).message)
+    }
+  }
+
+  async function triggerTaskRun(taskID: string) {
+    try {
+      await api.runTaskNow(config, taskID)
+      await refreshTasks()
+    } catch (err) {
+      setRuntimeError((err as Error).message)
+    }
+  }
+
+  async function openTaskHistory(taskID: string) {
+    setViewingTaskID(taskID)
+    setTaskHistory([])
+    await loadTaskHistory(taskID)
+  }
+
   useEffect(() => {
     if (!config.host || !config.password) return
+    loadRemoteConfig().catch(() => undefined)
     refreshSessions(true).catch(() => undefined)
     refreshPermissions().catch(() => undefined)
+    refreshQuestions().catch(() => undefined)
+    refreshTasks().catch(() => undefined)
     const timer = setInterval(() => {
       refreshSessions(true).catch(() => undefined)
       refreshPermissions().catch(() => undefined)
+      refreshQuestions().catch(() => undefined)
+      refreshTasks().catch(() => undefined)
       if (selectedSession) {
         loadSelected(selectedSession.id, selectedSession.directory, true).catch(() => undefined)
       }
+      if (viewingTaskID) {
+        loadTaskHistory(viewingTaskID).catch(() => undefined)
+      }
     }, 3500)
     return () => clearInterval(timer)
-  }, [config.host, config.password, selectedSession?.id])
+  }, [config.host, config.password, config.port, config.username, selectedSession?.id, viewingTaskID])
 
   useEffect(() => {
     const markVisible = () => {
@@ -783,8 +1268,13 @@ function App() {
       setTimeout(() => {
         refreshSessions(true).catch(() => undefined)
         refreshPermissions().catch(() => undefined)
+        refreshQuestions().catch(() => undefined)
+        refreshTasks().catch(() => undefined)
         if (selectedSession) {
           loadSelected(selectedSession.id, selectedSession.directory, true).catch(() => undefined)
+        }
+        if (viewingTaskID) {
+          loadTaskHistory(viewingTaskID).catch(() => undefined)
         }
       }, 500)
     }
@@ -810,7 +1300,7 @@ function App() {
       window.removeEventListener("pageshow", markVisible)
       window.removeEventListener("blur", markHidden)
     }
-  }, [selectedSession?.id, config.host, config.password])
+  }, [selectedSession?.id, config.host, config.password, config.port, config.username, viewingTaskID])
 
   useEffect(() => {
     if (!selectedSession) return
@@ -821,12 +1311,13 @@ function App() {
       })
       return
     }
+    if (isSessionRunning) return
     setPendingRunSince((current) => {
       if (!current[selectedSession.id]) return current
       const { [selectedSession.id]: _removed, ...rest } = current
       return rest
     })
-  }, [selectedSession?.id, selectedSession?.status])
+  }, [selectedSession?.id, selectedSession?.status, isSessionRunning])
 
   useEffect(() => {
     if (!hasConfiguredServer) {
@@ -843,6 +1334,23 @@ function App() {
     if (view !== "detail") return
     return scrollMessagesToBottom([0, 50])
   }, [messageStreamKey, view, selectedID])
+
+  useEffect(() => {
+    if (view !== "tasks" || !viewingTaskID || taskFormOpen) return
+    const container = taskMessagesRef.current
+    const latestRun = container?.lastElementChild as HTMLElement | null
+    if (!container || !latestRun) return
+
+    const scrollToLatestRunStart = () => {
+      const containerTop = container.getBoundingClientRect().top
+      const runTop = latestRun.getBoundingClientRect().top
+      container.scrollTo({ top: Math.max(0, container.scrollTop + runTop - containerTop - 8), behavior: "auto" })
+    }
+
+    scrollToLatestRunStart()
+    const timers = [50, 180].map((delay) => window.setTimeout(scrollToLatestRunStart, delay))
+    return () => timers.forEach((timer) => window.clearTimeout(timer))
+  }, [orderedTaskHistory.length, taskFormOpen, view, viewingTaskID])
 
   useEffect(() => {
     if (view !== "detail") return
@@ -895,11 +1403,7 @@ function App() {
             <span className="thinking-label">Thinking</span>
           </button>
           {isExpanded && (
-            <div className="thinking-content">
-              {toDisplayLines(part.text).map((line, i) => (
-                <p key={i}>{renderInline(line)}</p>
-              ))}
-            </div>
+            <div className="thinking-content message-richtext">{renderRichText(part.text, `thinking-${part.id}`)}</div>
           )}
         </div>
       )
@@ -936,13 +1440,8 @@ function App() {
     }
 
     if (part.type === "text" && part.text) {
-      const lines = toDisplayLines(part.text)
       return (
-        <div key={part.id} className="message-text-content">
-          {lines.map((line, index) => (
-            <p key={index}>{renderInline(line)}</p>
-          ))}
-        </div>
+        <div key={part.id} className="message-text-content message-richtext">{renderRichText(part.text, `part-${part.id}`)}</div>
       )
     }
 
@@ -951,7 +1450,7 @@ function App() {
 
    return (
     <div className="app-shell">
-        <header className="top-nav panel fade-in">
+        <header className={menuOpen ? "top-nav panel menu-open" : "top-nav panel"}>
          <div className="brand-section">
            <div className="brand-title">
              <img src="/app-icon.png" alt="" className="app-icon" />
@@ -965,6 +1464,7 @@ function App() {
               type="button"
               className="btn-back"
               onClick={() => {
+                loadGenerationRef.current++
                 setView("sessions")
                 setSelectedID(null)
                 setMessages([])
@@ -1002,22 +1502,42 @@ function App() {
             <FolderIcon size={18} />
             <span>Sessions</span>
           </button>
+          <button
+            className={view === "tasks" ? "active" : ""}
+            onClick={() => {
+              setView("tasks")
+              setViewingTaskID(null)
+              setTaskFormOpen(false)
+              refreshTasks().catch(() => undefined)
+            }}
+            disabled={!hasConfiguredServer}
+            aria-label="Tasks"
+          >
+            <ClockIcon size={18} />
+            <span>Tasks</span>
+          </button>
         </nav>
 
         <div className="top-nav-actions">
-          {view === "detail" && (
+          {(view === "detail" || viewingTaskID) && (
             <button
               type="button"
               className="btn-back mobile-back-btn"
               onClick={() => {
-                setView("sessions")
-                setSelectedID(null)
-                setMessages([])
-                setTodos([])
-                setModelPickerOpen(false)
-                setThinkingPickerOpen(false)
+                if (view === "detail") {
+                  loadGenerationRef.current++
+                  setView("sessions")
+                  setSelectedID(null)
+                  setMessages([])
+                  setTodos([])
+                  setModelPickerOpen(false)
+                  setThinkingPickerOpen(false)
+                } else if (viewingTaskID) {
+                  setViewingTaskID(null)
+                  setTaskHistory([])
+                }
               }}
-              aria-label="Back to sessions"
+              aria-label="Back"
             >
               <BackIcon size={20} />
             </button>
@@ -1030,12 +1550,8 @@ function App() {
             <MenuIcon size={24} />
           </button>
         </div>
-      </header>
-
-      {menuOpen && (
-        <>
-          <div className="menu-backdrop" onClick={() => setMenuOpen(false)} />
-          <section className="panel menu-panel overlay fade-in">
+        {menuOpen && (
+          <section className="menu-panel embedded">
             <div className="menu-grid">
               <button 
                 className="menu-item"
@@ -1050,6 +1566,21 @@ function App() {
               >
                 <FolderIcon size={28} />
                 <span>Sessions</span>
+              </button>
+              <button
+                className="menu-item"
+                onClick={() => {
+                  setMenuOpen(false)
+                  setView("tasks")
+                  setViewingTaskID(null)
+                  setTaskFormOpen(false)
+                  refreshTasks().catch(() => undefined)
+                }}
+                disabled={!hasConfiguredServer}
+                aria-label="Tasks"
+              >
+                <ClockIcon size={28} />
+                <span>Tasks</span>
               </button>
               <button 
                 className="menu-item"
@@ -1066,8 +1597,8 @@ function App() {
               </button>
             </div>
           </section>
-        </>
-      )}
+        )}
+      </header>
 
 
       {view === "settings" && (
@@ -1115,6 +1646,25 @@ function App() {
               placeholder="Your server password"
             />
           </label>
+
+          <div className="settings-field">
+            <span className="settings-field-label">Appearance</span>
+            <div className="theme-toggle" role="radiogroup" aria-label="Theme">
+              {(["system", "dark", "light"] as ThemePreference[]).map((theme) => (
+                <button
+                  key={theme}
+                  type="button"
+                  className={themePreference === theme ? "theme-choice active" : "theme-choice"}
+                  onClick={() => setThemePreference(theme)}
+                  role="radio"
+                  aria-checked={themePreference === theme}
+                >
+                  {theme === "system" ? "System" : theme === "dark" ? "Dark" : "Light"}
+                </button>
+              ))}
+            </div>
+            <p className="subtle">Light mode uses brighter surfaces and stronger text contrast for daytime reading.</p>
+          </div>
           
           <div className="actions">
             <button 
@@ -1182,56 +1732,175 @@ function App() {
               </div>
               <p className="subtle">Root directory</p>
               <code className="root-directory-code">{managedRootDir || "Not configured on wrapper server yet"}</code>
+              <label htmlFor="new-session-title">
+                Session name
+                <input
+                  id="new-session-title"
+                  value={managedSessionTitle}
+                  onChange={(event) => setManagedSessionTitle(event.target.value)}
+                  placeholder="Leave blank for default"
+                />
+              </label>
               <label htmlFor="new-session-folder">
-                Folder inside root
+                Folder
                 <input
                   id="new-session-folder"
                   value={managedSessionFolder}
-                  onChange={(event) => setManagedSessionFolder(event.target.value)}
+                  onChange={(event) => {
+                    setManagedSessionFolder(event.target.value)
+                    setManagedFolderBrowsePath(event.target.value.split("/").filter(Boolean))
+                  }}
                   placeholder="Leave blank to start in the root folder"
                 />
               </label>
-              {managedFolders.length > 0 && (
-                <div className="folder-chip-row">
-                  <button
-                    type="button"
-                    className={`util-chip${managedSessionFolder === "" ? " util-chip-active" : ""}`}
-                    onClick={() => setManagedSessionFolder("")}
-                  >
-                    Root
-                  </button>
-                  {managedFolders.map((folder) => (
+              {(managedFolders.length > 0 || managedFolderBrowsePath.length > 0) && (
+                <div className="folder-browser">
+                  {managedFolderBrowsePath.length > 0 && (
+                    <p className="subtle folder-breadcrumb">
+                      Browsing: {managedFolderBrowsePath.join(" / ")}
+                    </p>
+                  )}
+                  <div className="folder-chip-row">
+                    {managedFolderBrowsePath.length > 0 && (
+                      <button
+                        type="button"
+                        className="util-chip"
+                        onClick={() => {
+                          const parentPath = managedFolderBrowsePath.slice(0, -1)
+                          setManagedFolderBrowsePath(parentPath)
+                          setManagedSessionFolder(parentPath.join("/"))
+                          loadManagedFolders(parentPath.join("/")).catch(() => undefined)
+                        }}
+                      >
+                        &larr; Back
+                      </button>
+                    )}
                     <button
-                      key={folder}
                       type="button"
-                      className={`util-chip${managedSessionFolder === folder ? " util-chip-active" : ""}`}
-                      onClick={() => setManagedSessionFolder(folder)}
+                      className={`util-chip${managedFolderBrowsePath.length === 0 ? " util-chip-active" : ""}`}
+                      onClick={() => {
+                        setManagedFolderBrowsePath([])
+                        setManagedSessionFolder("")
+                      }}
                     >
-                      {folder}
+                      Root
                     </button>
-                  ))}
+                    {managedFolders.map((folder) => {
+                      const fullPath = [...managedFolderBrowsePath, folder].join("/")
+                      return (
+                        <button
+                          key={folder}
+                          type="button"
+                          className={`util-chip${managedSessionFolder === fullPath ? " util-chip-active" : ""}`}
+                          onClick={() => {
+                            setManagedFolderBrowsePath((current) => [...current, folder])
+                            setManagedSessionFolder(fullPath)
+                            loadManagedFolders(fullPath).catch(() => undefined)
+                          }}
+                        >
+                          {folder}
+                        </button>
+                      )
+                    })}
+                  </div>
                 </div>
               )}
               {loadingManagedFolders && <p className="subtle">Loading folders...</p>}
               {!managedRootDir && !loadingManagedFolders && (
                 <p className="subtle">Set the wrapper root directory on the server first with `npm run server:set-root -- /absolute/path`.</p>
               )}
+              {discoveredSessions.length > 0 && (
+                <div className="existing-sessions">
+                  <button
+                    type="button"
+                    className="existing-sessions-toggle"
+                    onClick={() => setDiscoverExpanded((v) => !v)}
+                  >
+                    <span>{discoverExpanded ? "Hide" : "Show"} existing sessions ({discoveredSessions.length})</span>
+                    <span className={`chevron ${discoverExpanded ? "expanded" : ""}`}>&#9654;</span>
+                  </button>
+                  {discoverExpanded && (
+                    <div className="existing-session-list">
+                      {discoveredSessions.map((session) => (
+                        <button
+                          key={session.id}
+                          type="button"
+                          className={`existing-session-item${selectedManagedSessionID === session.id ? " existing-session-item-active" : ""}`}
+                          onClick={() => setSelectedManagedSessionID(session.id === selectedManagedSessionID ? null : session.id)}
+                        >
+                          <span className="existing-session-title">{session.title}</span>
+                          <span className={`pill ${session.status}`}>{session.status}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="inline-actions">
-                <button
-                  onClick={() => createSession().catch(() => undefined)}
-                  className="btn-primary"
-                  disabled={!managedRootDir || creatingManagedSession}
-                >
-                  {creatingManagedSession ? "Creating..." : "Create Session"}
-                </button>
-                <button
-                  type="button"
-                  className="btn-secondary"
-                  onClick={() => setManagedSessionOpen(false)}
-                  disabled={creatingManagedSession}
-                >
-                  Cancel
-                </button>
+                {selectedManagedSessionID ? (
+                  <>
+                    <button
+                      onClick={async () => {
+                        const match = discoveredSessions.find((s) => s.id === selectedManagedSessionID)
+                        if (!match) return
+                        setManagedSessionOpen(false)
+                        setSelectedManagedSessionID(null)
+                        setPinnedDiscoveredIDs((prev) => new Set(prev).add(match.id))
+                        setSessions((current) => {
+                          if (current.some((s) => s.id === match.id)) return current
+                          return [match, ...current]
+                        })
+                        setSelectedID(match.id)
+                        setMessages([])
+                        setTodos([])
+                        setView("detail")
+                        setLoadingSessionID(match.id)
+                        loadGenerationRef.current++
+                        try {
+                          const [msg, todo] = await Promise.all([
+                            api.loadDiscoveredMessages(config, match.id),
+                            api.loadDiscoveredTodos(config, match.id)
+                          ])
+                          setMessages(msg)
+                          setTodos(todo)
+                        } catch {
+                          try {
+                            await loadSelected(match.id, match.directory)
+                          } catch { /* silent */ }
+                        }
+                        setLoadingSessionID((id) => id === match.id ? null : id)
+                      }}
+                      className="btn-primary"
+                    >
+                      Open Session
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={() => setSelectedManagedSessionID(null)}
+                    >
+                      Deselect
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => createSession().catch(() => undefined)}
+                      className="btn-primary"
+                      disabled={!managedRootDir || creatingManagedSession}
+                    >
+                      {creatingManagedSession ? "Creating..." : "Create Session"}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={() => setManagedSessionOpen(false)}
+                      disabled={creatingManagedSession}
+                    >
+                      Cancel
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           )}
@@ -1254,15 +1923,36 @@ function App() {
               filteredSessions.map((session) => (
                 <article 
                   key={session.id} 
-                  className={`session-card ${selectedID === session.id ? "active" : ""} fade-in`}
+                  className={`session-card ${selectedID === session.id ? "active" : ""} ${sessionMenuID === session.id ? "menu-open" : ""} fade-in`}
+                  onClick={() => {
+                    if (renamingSessionID === session.id) return
+                    setSessionMenuID(null)
+                    openSession(session.id, session.directory).catch(() => undefined)
+                  }}
                 >
                   <div className="header-row">
                     <h3>{session.title}</h3>
-                    <span className={`pill ${session.status}`}>{session.status}</span>
+                    <div className="session-card-top-actions">
+                      <span className={`pill ${selectedID === session.id && isSessionRunning ? "busy" : session.status}`}>{selectedID === session.id && isSessionRunning ? "busy" : session.status}</span>
+                      <button
+                        type="button"
+                        className="session-menu-trigger"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setSessionMenuID((current) => current === session.id ? null : session.id)
+                        }}
+                        aria-haspopup="menu"
+                        aria-expanded={sessionMenuID === session.id}
+                        aria-label={`Session actions for ${session.title}`}
+                      >
+                        ...
+                      </button>
+                    </div>
                   </div>
                   {renamingSessionID === session.id && (
                     <form
                       className="rename-form"
+                      onClick={(event) => event.stopPropagation()}
                       onSubmit={(event) => {
                         event.preventDefault()
                         renameSession(session).catch(() => undefined)
@@ -1280,32 +1970,33 @@ function App() {
                       </div>
                     </form>
                   )}
-                  <p>{session.directory}</p>
-                   <div className="inline-actions">
-                     <button
-                       onClick={() => openSession(session.id, session.directory).catch(() => undefined)}
-                       className="btn-primary"
-                     >
-                       <PlayIcon size={16} />
-                       Open
-                     </button>
-                     <button
-                       onClick={() => {
-                         if (renamingSessionID === session.id) cancelRenameSession()
-                         else beginRenameSession(session)
-                       }}
-                       className="btn-secondary"
-                     >
-                       {renamingSessionID === session.id ? "Close Rename" : "Rename"}
-                     </button>
-                     <button 
-                       className="btn-danger" 
-                       onClick={() => deleteSession(session.id)}
-                     >
-                      <TrashIcon size={16} />
-                      Delete
-                    </button>
-                  </div>
+                  <p title={session.directory}>{formatDirectoryLabel(session.directory, managedRootDir)}</p>
+                  {sessionMenuID === session.id && (
+                    <div className="session-card-menu" role="menu" onClick={(event) => event.stopPropagation()}>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          if (renamingSessionID === session.id) cancelRenameSession()
+                          else beginRenameSession(session)
+                        }}
+                      >
+                        {renamingSessionID === session.id ? "Close rename" : "Rename"}
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="danger-menu-item"
+                        onClick={() => {
+                          setSessionMenuID(null)
+                          deleteSession(session.id)
+                        }}
+                      >
+                        <TrashIcon size={15} />
+                        Delete
+                      </button>
+                    </div>
+                  )}
                 </article>
               ))
             )}
@@ -1313,6 +2004,395 @@ function App() {
           
           {runtimeError && <div className="error fade-in">✗ {runtimeError}</div>}
         </section>
+      )}
+
+      {view === "tasks" && (!viewingTaskID || taskFormOpen) && (
+        <section className="panel sessions fade-in">
+          {!taskFormOpen && (
+            <>
+              <div className="header-row">
+                <h2>Scheduled Tasks</h2>
+                <div className="inline-actions">
+                  <button onClick={() => openTaskForm()} className="btn-primary">
+                    <PlusIcon size={18} />
+                    New Task
+                  </button>
+                </div>
+              </div>
+
+              {tasks.length === 0 ? (
+                <div style={{ textAlign: "center", padding: "var(--space-8)", color: "var(--secondary-500)" }}>
+                  <ClockIcon size={48} className="icon-empty-state" />
+                  <p>No scheduled tasks</p>
+                  <p className="subtle">Create a task to run prompts on a schedule</p>
+                </div>
+              ) : (
+                <div className="session-list">
+                  {tasks.map((task) => (
+                    <article key={task.id} className="session-card fade-in task-card">
+                      <button type="button" className="task-card-open" onClick={() => openTaskHistory(task.id)}>
+                        <div className="task-card-title-row">
+                          <strong className="session-title">{task.title}</strong>
+                          <span className={`task-state-chip ${task.running ? "busy" : task.enabled ? "idle" : "paused"}`}>
+                            <span className="task-state-dot" aria-hidden="true" />
+                            {task.running ? "Running" : task.enabled ? "Active" : "Paused"}
+                          </span>
+                        </div>
+                      </button>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {taskFormOpen && (
+            <div className="new-session-panel fade-in">
+              <div className="header-row">
+                <strong>{editingTask ? "Edit Task" : "Create Scheduled Task"}</strong>
+              </div>
+
+              <label htmlFor="task-title">
+                Task name
+                <input
+                  id="task-title"
+                  value={taskFormTitle}
+                  onChange={(e) => setTaskFormTitle(e.target.value)}
+                  placeholder="e.g. Daily summary"
+                />
+              </label>
+
+              <label htmlFor="task-prompt">
+                Prompt
+                <textarea
+                  id="task-prompt"
+                  value={taskFormPrompt}
+                  onChange={(e) => setTaskFormPrompt(e.target.value)}
+                  placeholder="Write the prompt to send..."
+                  rows={4}
+                />
+              </label>
+
+              <label htmlFor="task-folder">
+                Folder
+                <input
+                  id="task-folder"
+                  value={taskFormFolder}
+                  onChange={(e) => {
+                    setTaskFormFolder(e.target.value)
+                    setManagedFolderBrowsePath(e.target.value.split("/").filter(Boolean))
+                  }}
+                  placeholder="Leave blank for root folder"
+                />
+              </label>
+              {(managedFolders.length > 0 || managedFolderBrowsePath.length > 0) && (
+                <div className="folder-browser">
+                  {managedFolderBrowsePath.length > 0 && (
+                    <p className="subtle folder-breadcrumb">Browsing: {managedFolderBrowsePath.join(" / ")}</p>
+                  )}
+                  <div className="folder-chip-row">
+                    {managedFolderBrowsePath.length > 0 && (
+                      <button
+                        type="button"
+                        className="util-chip"
+                        onClick={() => {
+                          const parentPath = managedFolderBrowsePath.slice(0, -1)
+                          setManagedFolderBrowsePath(parentPath)
+                          setTaskFormFolder(parentPath.join("/"))
+                          loadManagedFolders(parentPath.join("/")).catch(() => undefined)
+                        }}
+                      >
+                        &larr; Back
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className={`util-chip${managedFolderBrowsePath.length === 0 ? " util-chip-active" : ""}`}
+                      onClick={() => {
+                        setManagedFolderBrowsePath([])
+                        setTaskFormFolder("")
+                      }}
+                    >
+                      Root
+                    </button>
+                    {managedFolders.map((folder) => {
+                      const fullPath = [...managedFolderBrowsePath, folder].join("/")
+                      return (
+                        <button
+                          key={folder}
+                          type="button"
+                          className={`util-chip${taskFormFolder === fullPath ? " util-chip-active" : ""}`}
+                          onClick={() => {
+                            setManagedFolderBrowsePath((current) => [...current, folder])
+                            setTaskFormFolder(fullPath)
+                            loadManagedFolders(fullPath).catch(() => undefined)
+                          }}
+                        >
+                          {folder}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+
+              <div className="task-form-grid">
+                <label htmlFor="task-time">
+                  Time (server local)
+                  <input
+                    id="task-time"
+                    type="time"
+                    value={taskFormTime}
+                    onChange={(e) => setTaskFormTime(e.target.value)}
+                  />
+                </label>
+
+                <label htmlFor="task-repeat">
+                  Repeat
+                  <select
+                    id="task-repeat"
+                    value={taskFormRepeat}
+                    onChange={(e) => setTaskFormRepeat(e.target.value as "once" | "daily" | "weekly" | "monthly")}
+                  >
+                    <option value="once">Once</option>
+                    <option value="daily">Daily</option>
+                    <option value="weekly">Weekly</option>
+                    <option value="monthly">Monthly</option>
+                  </select>
+                </label>
+              </div>
+
+              {taskFormRepeat === "weekly" && (
+                <label htmlFor="task-dow">
+                  Day of week
+                  <select
+                    id="task-dow"
+                    value={taskFormDayOfWeek}
+                    onChange={(e) => setTaskFormDayOfWeek(Number(e.target.value))}
+                  >
+                    <option value={0}>Sunday</option>
+                    <option value={1}>Monday</option>
+                    <option value={2}>Tuesday</option>
+                    <option value={3}>Wednesday</option>
+                    <option value={4}>Thursday</option>
+                    <option value={5}>Friday</option>
+                    <option value={6}>Saturday</option>
+                  </select>
+                </label>
+              )}
+
+              {taskFormRepeat === "monthly" && (
+                <label htmlFor="task-dom">
+                  Day of month
+                  <input
+                    id="task-dom"
+                    type="number"
+                    min={1}
+                    max={31}
+                    value={taskFormDayOfMonth}
+                    onChange={(e) => setTaskFormDayOfMonth(Number(e.target.value))}
+                  />
+                </label>
+              )}
+
+              <div className="task-form-grid">
+                <label htmlFor="task-model">
+                  Model
+                  <select
+                    id="task-model"
+                    value={taskFormModel ? `${taskFormModel.providerID}/${taskFormModel.modelID}` : ""}
+                    onChange={(e) => {
+                      const nextValue = e.target.value
+                      if (!nextValue) {
+                        setTaskFormModel(null)
+                        setTaskFormVariant(null)
+                        return
+                      }
+                      const [providerID, modelID] = nextValue.split("/")
+                      const nextModel = taskModels.find((model) => model.providerID === providerID && model.id === modelID)
+                      setTaskFormModel({ providerID, modelID })
+                      if (!nextModel?.variants.includes(taskFormVariant ?? "")) {
+                        setTaskFormVariant(nextModel?.variants[0] ?? null)
+                      }
+                    }}
+                  >
+                    <option value="">Default model</option>
+                    {taskModels.map((model) => (
+                      <option key={`${model.providerID}/${model.id}`} value={`${model.providerID}/${model.id}`}>
+                        {model.name} ({model.providerID})
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label htmlFor="task-thinking">
+                  Thinking
+                  <select
+                    id="task-thinking"
+                    value={taskFormVariant ?? ""}
+                    onChange={(e) => setTaskFormVariant(e.target.value || null)}
+                  >
+                    <option value="">Default</option>
+                    {(selectedTaskModelInfo?.variants ?? []).map((variant) => (
+                      <option key={variant} value={variant}>{variant}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+
+              <div className="task-research-panel">
+                <label htmlFor="task-live-web" className="task-toggle-row">
+                  <span>
+                    <strong>Live Web Research</strong>
+                    <span className="subtle">Expose Brave or Tavily as a search tool the AI can call when needed.</span>
+                  </span>
+                  <input
+                    id="task-live-web"
+                    type="checkbox"
+                    checked={taskFormLiveWebResearch}
+                    onChange={(e) => setTaskFormLiveWebResearch(e.target.checked)}
+                  />
+                </label>
+
+                {taskFormLiveWebResearch && (
+                  <div className="task-form-grid">
+                    <label htmlFor="task-search-provider">
+                      Search provider
+                      <select
+                        id="task-search-provider"
+                        value={taskFormSearchProvider}
+                        onChange={(e) => setTaskFormSearchProvider(e.target.value as "tavily" | "brave")}
+                      >
+                        <option value="tavily" disabled={!researchProviders.tavily}>Tavily{researchProviders.tavily ? "" : " (not configured)"}</option>
+                        <option value="brave" disabled={!researchProviders.brave}>Brave{researchProviders.brave ? "" : " (not configured)"}</option>
+                      </select>
+                    </label>
+
+                  </div>
+                )}
+
+                {taskFormLiveWebResearch && !researchProviders.tavily && !researchProviders.brave && (
+                  <p className="subtle">No live research providers are configured on the wrapper server yet.</p>
+                )}
+              </div>
+
+              <div className="inline-actions" style={{ marginTop: "var(--space-4)" }}>
+                <button
+                  onClick={() => saveTask()}
+                  className="btn-primary"
+                  disabled={
+                    savingTask ||
+                    !taskFormTitle.trim() ||
+                    !taskFormPrompt.trim() ||
+                    (taskFormLiveWebResearch && !(taskFormSearchProvider === "tavily" ? researchProviders.tavily : researchProviders.brave))
+                  }
+                >
+                  {savingTask ? "Saving..." : editingTask ? "Update Task" : "Create Task"}
+                </button>
+                {editingTask && (
+                  <button
+                    type="button"
+                    className="btn-danger"
+                    onClick={() => {
+                      deleteTaskAction(editingTask.id).catch(() => undefined)
+                      setTaskFormOpen(false)
+                      setEditingTask(null)
+                    }}
+                    disabled={savingTask}
+                  >
+                    <TrashIcon size={16} />
+                    Delete
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={() => { setTaskFormOpen(false); setEditingTask(null) }}
+                  disabled={savingTask}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
+
+      {view === "tasks" && viewingTaskID && !taskFormOpen && (
+        <main className="panel detail fade-in task-channel-panel">
+          <div className="task-channel-header">
+            <div className="task-channel-title-row">
+              <button className="btn-back" onClick={() => { setViewingTaskID(null); setTaskHistory([]) }}>
+                <BackIcon size={18} />
+                <span>Back to Tasks</span>
+              </button>
+              <div className="task-channel-meta">
+                <h2>{selectedTask?.title ?? "Task"}</h2>
+                <p className="subtle">
+                  {selectedTask ? formatTaskSchedule(selectedTask) : ""}
+                  {selectedTask?.folder ? ` • ${selectedTask.folder}` : ""}
+                </p>
+              </div>
+            </div>
+
+            {selectedTask && (
+              <div className="inline-actions">
+                <button className="btn-secondary btn-sm" onClick={() => openTaskForm(selectedTask)}>
+                  Edit
+                </button>
+                <button
+                  className={selectedTask.enabled ? "btn-secondary btn-sm" : "btn-primary btn-sm"}
+                  onClick={() => toggleTaskEnabled(selectedTask)}
+                >
+                  {selectedTask.enabled ? "Pause" : "Resume"}
+                </button>
+                <button className="btn-primary btn-sm" onClick={() => triggerTaskRun(selectedTask.id)} disabled={selectedTask.running}>
+                  {selectedTask.running ? <LoadingIcon size={14} /> : <PlayIcon size={14} />}
+                  Run Now
+                </button>
+              </div>
+            )}
+          </div>
+
+          <div className="messages task-channel-messages" ref={taskMessagesRef}>
+            {orderedTaskHistory.length === 0 ? (
+              <div style={{ textAlign: "center", padding: "var(--space-8)", color: "var(--secondary-500)" }}>
+                <ClockIcon size={48} className="icon-empty-state" />
+                <p>No runs yet</p>
+                <p className="subtle">Run this task once to start the channel history.</p>
+              </div>
+            ) : (
+              orderedTaskHistory.map((run) => (
+                <div key={run.id} className="task-run-thread fade-in">
+                  <div className="task-run-stamp">
+                    {run.status !== "completed" && (
+                      <span className={`pill ${run.status === "error" ? "retry" : "busy"}`}>
+                        {run.status === "error" ? "Failed" : "Running"}
+                      </span>
+                    )}
+                    <small>{formatTime(run.startedAt)}</small>
+                  </div>
+
+                  <article className="message assistant fade-in">
+                    <header>
+                      <strong>{selectedTask?.title ?? "Scheduled Task"}</strong>
+                      <small>{formatTime(run.finishedAt ?? run.startedAt)}</small>
+                    </header>
+                    <div className="message-content message-richtext">
+                      {run.error ? (
+                        <div className="error">{run.error}</div>
+                      ) : run.responseText ? (
+                        renderRichText(run.responseText, `task-run-${run.id}`)
+                      ) : (
+                        <p className="subtle">Waiting for the response...</p>
+                      )}
+                    </div>
+                  </article>
+                </div>
+              ))
+            )}
+          </div>
+        </main>
       )}
 
       {view === "detail" && (
@@ -1368,30 +2448,31 @@ function App() {
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault()
-                    if (!isWorking) {
-                      send().catch(() => undefined)
-                    }
+                    send().catch(() => undefined)
                   }
                 }}
-                disabled={!selectedSession || isWorking}
-              />
-              <button 
-                onClick={isWorking ? abortSession : send}
                 disabled={!selectedSession}
-                className={isWorking ? "btn-secondary" : "btn-primary"}
-              >
-                {isWorking ? (
-                  <>
+              />
+              <div className="composer-actions">
+                {isWorking && (
+                  <button 
+                    onClick={abortSession}
+                    disabled={!selectedSession}
+                    className="btn-secondary btn-composer-abort"
+                  >
                     <StopIcon size={18} />
                     Abort
-                  </>
-                ) : (
-                  <>
-                    <RocketIcon size={18} />
-                    Send
-                  </>
+                  </button>
                 )}
-              </button>
+                <button 
+                  onClick={send}
+                  disabled={!selectedSession}
+                  className="btn-primary"
+                >
+                  <RocketIcon size={18} />
+                  Send
+                </button>
+              </div>
             </div>
 
             {runtimeError && <div className="error fade-in">✗ {runtimeError}</div>}
@@ -1432,6 +2513,41 @@ function App() {
                           onClick={() => replyPermission(perm.id, "reject")}
                         >
                           Reject
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {sessionQuestions.length > 0 && (
+                <div className="util-panel util-panel-perm util-panel-sheet">
+                  {sessionQuestions.map((q) => (
+                    <div key={q.id} className="permission-request">
+                      <div className="permission-details">
+                        <span className="permission-name">Question</span>
+                        <p style={{ margin: "var(--space-1) 0 0", fontSize: "var(--text-sm)" }}>{q.question}</p>
+                      </div>
+                      <div className="permission-actions" style={{ flexWrap: "wrap" }}>
+                        <input
+                          type="text"
+                          value={replyingQuestionID === q.id ? questionAnswer : ""}
+                          onChange={(e) => {
+                            setReplyingQuestionID(q.id)
+                            setQuestionAnswer(e.target.value)
+                          }}
+                          placeholder="Type your answer..."
+                          style={{ flex: "1 1 100%", marginBottom: "var(--space-2)" }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") replyQuestion(q.id)
+                          }}
+                        />
+                        <button
+                          className="btn-primary btn-sm"
+                          disabled={replyingQuestionID === q.id && !questionAnswer.trim()}
+                          onClick={() => replyQuestion(q.id)}
+                        >
+                          {replyingQuestionID === q.id ? "Sending..." : "Answer"}
                         </button>
                       </div>
                     </div>
@@ -1515,6 +2631,15 @@ function App() {
                   }}
                 >
                   🔴 Permissions ({sessionPermissions.length})
+                </button>
+              )}
+              {sessionQuestions.length > 0 && (
+                <button
+                  type="button"
+                  className="util-chip util-chip-perm"
+                  style={{ cursor: "default" }}
+                >
+                  ❓ Questions ({sessionQuestions.length})
                 </button>
               )}
               <button

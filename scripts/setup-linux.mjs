@@ -142,6 +142,10 @@ async function promptPasswordWithConfirmation() {
   }
 }
 
+async function promptOptionalSecret(label) {
+  return await promptHidden(`${label} (optional): `)
+}
+
 function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -233,6 +237,11 @@ async function maybeEnableLinger(username) {
   }
 }
 
+async function stopExistingManagedServices() {
+  await runCommand("systemctl", ["--user", "stop", wrapperServiceName], { allowFailure: true })
+  await runCommand("systemctl", ["--user", "stop", opencodeServiceName], { allowFailure: true })
+}
+
 async function main() {
   if (process.platform !== "linux") fail("This setup script currently supports Linux only")
 
@@ -245,6 +254,10 @@ async function main() {
   const username = await promptRequired("Shared username", "opencode")
   const password = await promptPasswordWithConfirmation()
   const rootDir = path.resolve(await promptRequired("Managed root directory", defaultRootDir))
+  const tavilyApiKey = await promptOptionalSecret("Tavily API key")
+  const braveApiKey = await promptOptionalSecret("Brave Search API key")
+
+  await stopExistingManagedServices()
 
   const wrapperPortUsage = await checkPortUsage(wrapperPort)
   if (wrapperPortUsage) {
@@ -272,7 +285,9 @@ async function main() {
     upstreamUsername: username,
     upstreamPassword: password,
     clientUsername: username,
-    clientPassword: password
+    clientPassword: password,
+    tavilyApiKey,
+    braveApiKey
   })
 
   await writeExecutableFile(wrapperEnvPath, formatEnvironmentFile({
@@ -282,6 +297,8 @@ async function main() {
     OPENCODE_REMOTE_USERNAME: username,
     OPENCODE_REMOTE_PASSWORD: password,
     OPENCODE_REMOTE_CONFIG: path.join(repoRoot, "server-config.json"),
+    TAVILY_API_KEY: tavilyApiKey,
+    BRAVE_API_KEY: braveApiKey,
     OPENCODE_REMOTE_HOSTNAME: "0.0.0.0",
     OPENCODE_REMOTE_PORT: String(wrapperPort)
   }))
@@ -317,6 +334,8 @@ async function main() {
   process.stdout.write(`- OpenCode service: ${opencodeStatus.stdout.trim() || "unknown"}\n`)
   process.stdout.write(`- Wrapper service: ${wrapperStatus.stdout.trim() || "unknown"}\n`)
   process.stdout.write(`- Managed root: ${rootDir}\n`)
+  process.stdout.write(`- Tavily research: ${tavilyApiKey ? "configured" : "not configured"}\n`)
+  process.stdout.write(`- Brave research: ${braveApiKey ? "configured" : "not configured"}\n`)
   process.stdout.write(`- Service files: ${opencodeServicePath}, ${wrapperServicePath}\n`)
   process.stdout.write(`- App port: ${wrapperPort}\n`)
   process.stdout.write("\nUseful commands:\n")

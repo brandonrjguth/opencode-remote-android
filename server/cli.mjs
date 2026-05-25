@@ -14,7 +14,13 @@ async function main() {
 
   if (command === "show-config") {
     const config = await readRuntimeConfig()
-    process.stdout.write(`${JSON.stringify({ ...config, upstreamPassword: config.upstreamPassword ? "***" : "", clientPassword: config.clientPassword ? "***" : "" }, null, 2)}\n`)
+    process.stdout.write(`${JSON.stringify({
+      ...config,
+      upstreamPassword: config.upstreamPassword ? "***" : "",
+      clientPassword: config.clientPassword ? "***" : "",
+      tavilyApiKey: config.tavilyApiKey ? "***" : "",
+      braveApiKey: config.braveApiKey ? "***" : ""
+    }, null, 2)}\n`)
     return
   }
 

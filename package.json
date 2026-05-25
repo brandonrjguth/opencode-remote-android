@@ -4,8 +4,12 @@
   "type": "module",
   "scripts": {
     "setup:linux": "node scripts/setup-linux.mjs",
+    "setup:research": "node scripts/setup-research.mjs",
     "server:start": "node server/index.mjs",
     "server:set-root": "node server/cli.mjs set-root",
     "server:show-config": "node server/cli.mjs show-config"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.10.0"
   }
 }
